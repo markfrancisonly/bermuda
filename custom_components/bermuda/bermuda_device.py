@@ -27,6 +27,8 @@ from homeassistant.components.private_ble_device import coordinator as pble_coor
 from homeassistant.const import STATE_HOME, STATE_NOT_HOME
 from homeassistant.core import callback
 from homeassistant.helpers import area_registry as ar
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import floor_registry as fr
 from homeassistant.util import slugify
 
@@ -308,6 +310,15 @@ class BermudaDevice(dict):
         scanner_devreg_mac_address = None
         scanner_devreg_bt_address = None
 
+        # HA records the exact link for ESPHome proxies (2025.4+): the esphome config
+        # entry stores the scanner address. Prefer it over the MAC-offset search below,
+        # which can land on another integration's device in the same MAC range and
+        # finds nothing for proxies whose MACs don't follow the Espressif layout.
+        esphome_match = self._async_esphome_device_for_scanner()
+        if esphome_match is not None:
+            scanner_devreg_mac, scanner_devreg_mac_address = esphome_match
+        offset_macs: dict[str, dr.DeviceEntry] = {}  # every MAC the offset search could have settled on
+
         # We don't know which address is being reported/used. So create the full
         # range of possible addresses, and see what we find in the device registry,
         # on the *assumption* that there won't be overlap between devices.
@@ -331,9 +342,16 @@ class BermudaDevice(dict):
                     scanner_devreg_bt = devreg_device
                     scanner_devreg_bt_address = conn[1].lower()
                 if conn[0] == "mac":
-                    # ESPHome, Shelly
-                    scanner_devreg_mac = devreg_device
-                    scanner_devreg_mac_address = conn[1]
+                    offset_macs[conn[1]] = devreg_device
+                    if esphome_match is None:
+                        # ESPHome, Shelly
+                        scanner_devreg_mac = devreg_device
+                        scanner_devreg_mac_address = conn[1]
+
+        if esphome_match is not None:
+            self._async_migrate_scanner_entities(
+                scanner_devreg_mac, scanner_devreg_mac_address, offset_macs, scanner_devreg_bt
+            )
 
         if devreg_count not in (1, 2, 3):
             # We expect just the bt, or bt and another like esphome/shelly, or
@@ -414,6 +432,89 @@ class BermudaDevice(dict):
         self.make_name()
 
         self._update_area_and_floor(_area_id)
+
+    def _async_esphome_device_for_scanner(self) -> tuple[dr.DeviceEntry, str] | None:
+        """
+        Return the ESPHome device, and its MAC, whose config entry reports this scanner's address.
+
+        HA 2025.4+ stores the scanner address as ``bluetooth_mac_address`` on the esphome
+        config entry, whose unique_id is the device MAC; older entries just won't match.
+        """
+        source = self._hascanner.source.lower()
+        for entry in self._coordinator.hass.config_entries.async_entries("esphome"):
+            if str(entry.data.get("bluetooth_mac_address") or "").lower() != source:
+                continue
+            entry_mac = (entry.unique_id or "").lower()
+            for device in dr.async_entries_for_config_entry(self._coordinator.dr, entry.entry_id):
+                for conn in device.connections:
+                    if conn[0] == "mac" and conn[1].lower() == entry_mac:
+                        return device, conn[1]
+        return None
+
+    def _async_migrate_scanner_entities(
+        self,
+        esphome_device: dr.DeviceEntry,
+        new_mac: str,
+        offset_macs: dict[str, dr.DeviceEntry],
+        own_bt_device: dr.DeviceEntry | None,
+    ) -> None:
+        """
+        Re-key distance entities from a MAC the offset search had settled on to the proxy's MAC.
+
+        Entity ids are kept. A MAC that is another ESPHome or Shelly device's is another
+        scanner's identity and is left alone, as is one that another scanner's offset
+        search also covers (its entities could be either scanner's), and any entity
+        whose new unique_id is taken.
+        """
+        hass = self._coordinator.hass
+        tails: dict[str, str] = {}
+        for old_mac, device in offset_macs.items():
+            if old_mac.lower() == new_mac.lower():
+                continue
+            if device.id != esphome_device.id and any(
+                (entry := hass.config_entries.async_get_entry(entry_id)) is not None
+                and entry.domain in ("esphome", "shelly")
+                for entry_id in device.config_entries
+            ):
+                continue
+            if self._other_scanner_covers(old_mac, own_bt_device):
+                _LOGGER_SPAM_LESS.warning(
+                    f"migrate_ambiguous_{self.address}_{old_mac}",
+                    "Not re-keying entities from scanner MAC %s: another scanner's MAC search also covers it",
+                    old_mac,
+                )
+                continue
+            for suffix in ("_range", "_range_raw"):
+                tails[f"_{old_mac}{suffix}"] = f"_{new_mac}{suffix}"
+        if not tails:
+            return
+        registry = self._coordinator.er
+        for entity in er.async_entries_for_config_entry(registry, self._coordinator.config_entry.entry_id):
+            old_tail = next((tail for tail in tails if entity.unique_id.endswith(tail)), None)
+            if old_tail is None:
+                continue
+            new_unique_id = entity.unique_id[: -len(old_tail)] + tails[old_tail]
+            if registry.async_get_entity_id(entity.domain, DOMAIN, new_unique_id) is not None:
+                _LOGGER_SPAM_LESS.warning(
+                    f"migrate_conflict_{entity.entity_id}",
+                    "Not re-keying %s to scanner MAC %s: that unique_id already belongs to another entity",
+                    entity.entity_id,
+                    new_mac,
+                )
+                continue
+            registry.async_update_entity(entity.entity_id, new_unique_id=new_unique_id)
+            _LOGGER.info("Re-keyed %s to scanner MAC %s", entity.entity_id, new_mac)
+
+    def _other_scanner_covers(self, mac: str, own_bt_device: dr.DeviceEntry | None) -> bool:
+        """Whether another scanner's MAC-offset search would also have covered this MAC."""
+        connections = set()
+        for offset in range(-2, 4):  # the inverse of the range(-3, 3) search
+            if (address := mac_math_offset(mac, offset)) is not None and address.lower() != self.address.lower():
+                connections.add(("bluetooth", address.upper()))
+        return any(
+            own_bt_device is None or device.id != own_bt_device.id
+            for device in self._coordinator.dr.devices.get_entries(None, connections=connections)
+        )
 
     def _update_area_and_floor(self, area_id: str | None):
         """Given an area_id, update the area and floor properties."""
